@@ -274,6 +274,11 @@
     </div>
 
     <div class="errmsg" id="errorMsg"></div>
+    <div class="pgwrap" id="pgwrap">
+      <div class="pghead"><span class="pglbl" id="pglbl">Scanning...</span><span class="pgpct" id="pgpct">0%</span></div>
+      <div class="pgtrack"><div class="pgfill" id="pgfill"></div></div>
+      <div class="pglog" id="pglog"></div>
+    </div>
 
     <div class="twrap">
       <div class="thead">
@@ -314,13 +319,16 @@
   </div>
 
   <div class="footer">
-    <span>Data: CoinGecko public API &nbsp;·&nbsp; Auto-close: 16:00 local</span>
+    <span>Data: Binance public API &nbsp;·&nbsp; 15-min candles &nbsp;·&nbsp; Auto-close: 16:00 local</span>
     <span id="footerTs"></span>
   </div>
 </div>
 
 <script>
-const CG = 'https://api.coingecko.com/api/v3';
+const CG  = 'https://api.coingecko.com/api/v3';
+const BIN = 'https://api.binance.com/api/v3';
+const CANDLES_24H  = 96;
+const INTERVAL_MS  = 15 * 60 * 1000;
 const CLOSE_H = 16;
 
 // Storage
@@ -615,90 +623,199 @@ function toggleBrief(p,c){
   if(pe){pe.classList.toggle('open');ce.classList.toggle('open');}
 }
 
-// Main scan
+// Progress helpers
+function setProg(pct, lbl, line) {
+  const pw = document.getElementById('pgwrap');
+  pw.classList.add('on');
+  document.getElementById('pgfill').style.width = pct + '%';
+  document.getElementById('pgpct').textContent  = Math.round(pct) + '%';
+  document.getElementById('pglbl').textContent  = lbl;
+  if (line !== undefined) {
+    const log  = document.getElementById('pglog');
+    const prev = log.querySelector('.cur');
+    if (prev) prev.classList.remove('cur');
+    const d = document.createElement('div');
+    d.className = 'cur';
+    d.textContent = '› ' + line;
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+// Binance fetch
+async function binFetch(url, retries=3) {
+  for (let i=0; i<retries; i++) {
+    try {
+      const r = await fetch(url);
+      if (r.status===429||r.status===418) { await new Promise(res=>setTimeout(res,8000)); continue; }
+      if (!r.ok) throw new Error('HTTP '+r.status);
+      return await r.json();
+    } catch(e) { if(i===retries-1) throw e; await new Promise(res=>setTimeout(res,2000)); }
+  }
+}
+
+// Main scan — Binance data, same as backtest
 async function runScan() {
   const btn=document.getElementById('scanBtn'), pl=document.getElementById('pulseEl'), lb=document.getElementById('btnLabel'), err=document.getElementById('errorMsg');
-  btn.classList.add('loading'); pl.classList.remove('idle'); lb.textContent='SCANNING...'; err.style.display='none'; shimmer();
+  btn.classList.add('loading'); pl.classList.remove('idle'); lb.textContent='SCANNING...';
+  err.style.display='none';
+  document.getElementById('pglog').innerHTML='';
+  document.getElementById('pgfill').style.width='0%';
+  shimmer();
 
-  const minG          = parseFloat(document.getElementById('minGain').value)      || 30;
-  const topN          = parseInt(document.getElementById('topN').value)            || 10;
-  const minV          = (parseFloat(document.getElementById('minVol').value)       || 800) / 100;
-  const minSc         = parseInt(document.getElementById('minScore').value)        || 0;
-  const SCAN_COINS    = parseInt(document.getElementById('scanCoins').value)       || 150;
-  const SKIP_TOP      = parseInt(document.getElementById('skipTop').value)         || 50;
-  const MAX_SIG_HOUR_AEST = parseInt(document.getElementById('maxSigHour').value) || 12;
-  const blRaw         = document.getElementById('blacklist').value;
-  const BLACKLIST     = new Set(blRaw.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean));
+  const minG           = parseFloat(document.getElementById('minGain').value)      || 30;
+  const topN           = parseInt(document.getElementById('topN').value)            || 10;
+  const minVolR        = (parseFloat(document.getElementById('minVol').value)       || 800) / 100;
+  const minSc          = parseInt(document.getElementById('minScore').value)        || 0;
+  const SCAN_COINS     = parseInt(document.getElementById('scanCoins').value)       || 150;
+  const SKIP_TOP       = parseInt(document.getElementById('skipTop').value)         || 50;
+  const MAX_SIG_H      = parseInt(document.getElementById('maxSigHour').value)      || 12;
+  const scanFrom       = parseInt(document.getElementById('scanFrom').value)        || 7;
+  const blRaw          = document.getElementById('blacklist').value;
+  const BLACKLIST      = new Set(blRaw.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean));
+  const targetRetracePct = parseFloat(document.getElementById('targetRetrace').value) || 35;
 
-  // Check time — warn if outside scan window
-  const nowAEST = new Date(Date.now() + 10*3600000);
-  const aestHour = nowAEST.getUTCHours();
-  const scanFrom = parseInt(document.getElementById('scanFrom').value) || 7;
-  const inWindow = aestHour >= scanFrom && aestHour < MAX_SIG_HOUR_AEST;
-  const maxHourLabel = MAX_SIG_HOUR_AEST <= 12 ? MAX_SIG_HOUR_AEST + 'pm' : (MAX_SIG_HOUR_AEST-12)+'pm';
+  // Time window check
+  const nowAEST   = new Date(Date.now() + 10*3600000);
+  const aestHour  = nowAEST.getUTCHours();
+  const inWindow  = aestHour >= scanFrom && aestHour < MAX_SIG_H;
+  const maxLbl    = MAX_SIG_H <= 12 ? MAX_SIG_H+'pm' : (MAX_SIG_H-12)+'pm';
+
+  if (!inWindow) {
+    document.getElementById('ts').textContent = `⚠ Outside window — best signals ${scanFrom}am–${maxLbl} AEST (now ${aestHour}:00 AEST)`;
+    document.getElementById('ts').style.color = 'var(--amber)';
+  } else {
+    document.getElementById('ts').style.color = '';
+  }
 
   try {
-    const pages=await Promise.all([1,2,3].map(p=>
-      fetch(`${CG}/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=${p}&price_change_percentage=24h`)
-        .then(r=>{if(!r.ok) throw new Error(`API ${r.status}`); return r.json();})
-    ));
-    // Ranks 51-200: skip top 50 mega-caps, take next 150
-    const all=pages.flat().slice(SKIP_TOP, SKIP_TOP + SCAN_COINS)
-      .filter(c => !BLACKLIST.has(c.symbol?.toUpperCase()));
-    document.getElementById('statScanned').textContent=all.length;
+    // ── Step 1: Get top USDT pairs from Binance ──
+    setProg(2, 'Fetching coin list from Binance...');
+    const tickers = await binFetch(`${BIN}/ticker/24hr`);
+    const pairs = tickers
+      .filter(t => t.symbol.endsWith('USDT') && !['UP','DOWN','BULL','BEAR'].some(x=>t.symbol.includes(x)) && !BLACKLIST.has(t.symbol.replace('USDT','')))
+      .sort((a,b) => parseFloat(b.quoteVolume)-parseFloat(a.quoteVolume))
+      .slice(SKIP_TOP, SKIP_TOP + SCAN_COINS);
 
-    // Show scan window warning in timestamp
-    if (!inWindow) {
-      document.getElementById('ts').textContent = `⚠ Outside scan window — best signals ${scanFrom}am–${maxHourLabel} AEST (now ${aestHour}:00 AEST)`;
-      document.getElementById('ts').style.color = 'var(--amber)';
-    } else {
-      document.getElementById('ts').style.color = '';
+    document.getElementById('statScanned').textContent = pairs.length;
+    setProg(5, `Scanning ${pairs.length} coins (ranks ${SKIP_TOP+1}–${SKIP_TOP+SCAN_COINS})...`, `${pairs.length} pairs selected`);
+
+    // ── Step 2: Fetch 15-min candles for each coin ──
+    const results = [];
+    let idx = 0;
+
+    for (const ticker of pairs) {
+      idx++;
+      const sym      = ticker.symbol;
+      const coinName = sym.replace('USDT','');
+      const pct      = 5 + (idx / pairs.length) * 90;
+      setProg(pct, `[${idx}/${pairs.length}] ${coinName}`);
+
+      try {
+        const candles = await binFetch(`${BIN}/klines?symbol=${sym}&interval=15m&limit=${CANDLES_24H+10}`);
+        if (!candles || candles.length < CANDLES_24H+2) continue;
+
+        // 24h rolling change — same as backtest
+        const closeNow   = parseFloat(candles[candles.length-2][4]);
+        const close24hAgo= parseFloat(candles[candles.length-2-CANDLES_24H][4]);
+        if (!close24hAgo || close24hAgo===0) continue;
+        const gain24h = ((closeNow - close24hAgo) / close24hAgo) * 100;
+        if (gain24h < minG) continue;
+
+        // True volume ratio — same as backtest
+        const allVols  = candles.slice(0,-1).map(c=>parseFloat(c[5]));
+        const avgVol   = allVols.reduce((a,b)=>a+b,0)/allVols.length;
+        const lastVol  = parseFloat(candles[candles.length-2][5]);
+        const volRatio = avgVol>0 ? lastVol/avgVol : 0;
+        if (volRatio < minVolR) continue;
+
+        // Score
+        const gs = Math.min(gain24h/200,1)*100;
+        const vs = Math.min(volRatio/5,1)*100;
+        const score = Math.round(gs*0.60 + vs*0.40);
+        if (score < minSc) continue;
+
+        // Levels — same formula as backtest
+        const ep = closeNow * (gain24h>=100 ? 0.92 : gain24h>=60 ? 0.94 : 0.96);
+        const sp = closeNow * (1 + (parseFloat(document.getElementById('stopBuf').value)||10)/100);
+        const approxPrev = closeNow / (1 + gain24h/100);
+        const tp = ep - (ep - approxPrev) * (targetRetracePct/100);
+
+        results.push({
+          id:            sym,
+          coinId:        sym,
+          name:          coinName,
+          symbol:        coinName,
+          image:         null,
+          current_price: closeNow,
+          price_change_percentage_24h: gain24h,
+          market_cap:    parseFloat(ticker.quoteVolume) * closeNow,
+          total_volume:  lastVol,
+          volRatio,
+          score,
+          ep, sp, tp,
+          // for brief() compat
+          binSymbol: sym,
+        });
+        setProg(pct, `[${idx}/${pairs.length}] Scanning...`, `${coinName}: +${gain24h.toFixed(1)}% vol ${volRatio.toFixed(1)}×`);
+      } catch(e) {
+        // skip coin on error
+      }
+      await new Promise(res=>setTimeout(res,80));
     }
 
-    const med=(()=>{
-      const rs=all.map(c=>c.total_volume/(c.market_cap||1)).sort((a,b)=>a-b);
-      return rs[Math.floor(rs.length/2)];
-    })();
+    setProg(98, 'Ranking results...');
 
-    const filt=all.filter(c=>c.price_change_percentage_24h>=minG&&c.market_cap)
-      .map(c=>({...c,volRatio:(c.total_volume/(c.market_cap||1))/med}));
+    document.getElementById('statPassed').textContent = results.length;
 
-    const vfilt=filt.filter(c=>c.volRatio>=minV);
-    document.getElementById('statPassed').textContent=vfilt.length;
-
-    if(!vfilt.length){
+    if (!results.length) {
       document.getElementById('statExtreme').textContent='0';
       document.getElementById('statAvgGain').textContent='—';
       document.getElementById('tableBody').innerHTML='<div class="stmsg"><div class="big">∅</div>No coins match filters</div>';
+      setProg(100,'Complete — no signals found');
       return;
     }
 
-    const scored=scoreCoins(vfilt).filter(c=>c.score>=minSc);
-    const top=scored.slice(0,topN);
+    // Sort by score desc
+    results.sort((a,b)=>b.score-a.score);
+    const top = results.slice(0,topN);
+
     document.getElementById('statExtreme').textContent=top.filter(c=>c.score>=75||c.price_change_percentage_24h>=100).length;
     document.getElementById('statAvgGain').textContent='+'+(top.reduce((s,c)=>s+c.price_change_percentage_24h,0)/top.length).toFixed(1)+'%';
 
     const now=new Date();
     const ts=now.toLocaleTimeString('en-AU',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' · '+now.toLocaleDateString('en-AU');
-    document.getElementById('ts').textContent=ts;
+    if(inWindow){ document.getElementById('ts').textContent=ts; }
     document.getElementById('footerTs').textContent='Last scan: '+ts;
 
-    const maxS=Math.max(...top.map(c=>c.score));
+    const maxS=Math.max(...top.map(c=>c.score),1);
     const locked=new Set(loadLog().filter(t=>t.outcome==='open'||t.outcome==='never-entered').map(t=>t.coinId));
 
     document.getElementById('tableBody').innerHTML=top.map((coin,i)=>{
       const g=coin.price_change_percentage_24h, sl=sigLabel(coin.score,g);
       const bp=Math.round((coin.score/maxS)*100);
-      const img=coin.image?`<img class="ci2" src="${coin.image}" alt="" onerror="this.outerHTML='<div class=cip>${coin.symbol.charAt(0).toUpperCase()}</div>'">`: `<div class="cip">${coin.symbol.charAt(0).toUpperCase()}</div>`;
-      const b=brief(coin), pid=`bp-${i}`, cid=`cv-${i}`;
-      const isLk=locked.has(coin.id);
-      const lkHtml=isLk?`<button class="lkbtn locked" id="lk-${coin.id}">✓ Locked</button>`:`<button class="lkbtn" id="lk-${coin.id}" onclick="lockCoin('${coin.id}')">+ Lock In</button>`;
+      const img=`<div class="cip">${coin.symbol.charAt(0).toUpperCase()}</div>`;
+      const b={
+        ep: coin.ep, sp: coin.sp, tp: coin.tp,
+        spct: (((coin.sp-coin.current_price)/coin.current_price)*100).toFixed(1),
+        tpct: (((coin.ep-coin.tp)/coin.ep)*100).toFixed(1),
+        rp: targetRetracePct/100,
+        et: 'wait for 2 consecutive red 15-min candles after pullback to entry zone',
+        rl: coin.score>=75?'HIGH':coin.score>=50?'MODERATE':'LOWER',
+        rc: coin.score>=75?'red':coin.score>=50?'amber':'green',
+        rr: coin.score>=75?'High vol spike — elevated squeeze risk':coin.score>=50?'Moderate risk — good liquidity':'Lower risk — strong liquidity',
+        sn: coin.score>=75?'High-conviction — scale in rather than full position':coin.score>=50?'Moderate conviction — consider half size':'Lower conviction — small size only',
+        pn: coin.volRatio>=8?'Volume 8×+ average — strong exhaustion signal. Wait for 2 red candles.':coin.volRatio>=5?'Significant vol spike — let initial wave exhaust first.':'Moderate spike — be patient with entry.',
+      };
+      const pid=`bp-${i}`, cid=`cv-${i}`;
+      const isLk=locked.has(coin.coinId);
+      const lkHtml=isLk?`<button class="lkbtn locked" id="lk-${coin.coinId}">✓ Locked</button>`:`<button class="lkbtn" id="lk-${coin.coinId}" onclick="lockCoinBin('${coin.coinId}')">+ Lock In</button>`;
       const safeData=JSON.stringify(coin).replace(/'/g,"&#39;");
 
       return `<div class="row ${tierCls(i)}" style="animation-delay:${i*35}ms">
-        <div class="rmain" onclick="toggleBrief('${pid}','${cid}')" data-cid="${coin.id}" data-coin='${safeData}'>
+        <div class="rmain" onclick="toggleBrief('${pid}','${cid}')" data-cid="${coin.coinId}" data-coin='${safeData}'>
           <div class="rnk">${i+1}</div>
-          <div class="cc">${img}<div><div class="cn">${coin.name}</div><div class="cs">${coin.symbol.toUpperCase()}</div></div></div>
+          <div class="cc">${img}<div><div class="cn">${coin.name}</div><div class="cs">${coin.symbol.toUpperCase()} · USDT</div></div></div>
           <div class="cell" style="color:var(--text)">${fmtP(coin.current_price)}</div>
           <div class="cell chg">+${g.toFixed(1)}%</div>
           <div class="cell" style="color:var(--muted);font-size:12px">${fmtM(coin.market_cap)}</div>
@@ -717,26 +834,49 @@ async function runScan() {
           </div>
           <div class="bins">
             <div class="binsl">▸ How to play this trade</div>
-            <div class="bstp"><div class="bstn">1.</div><div class="bstt">Wait for <span>${b.et}</span>. This is the most important rule — jumping in early is the #1 cause of stop-outs.</div></div>
-            <div class="bstp"><div class="bstn">2.</div><div class="bstt">Once both red candles close, enter short near <span>${fmtP(b.ep)}</span>. ${b.pn}</div></div>
-            <div class="bstp"><div class="bstn">3.</div><div class="bstt">Stop above <span>${fmtP(b.sp)}</span> (${b.spct}% above current price) — if price breaks here, the move is still running and the thesis is invalid. Exit immediately.</div></div>
-            <div class="bstp"><div class="bstn">4.</div><div class="bstt">Target <span>${fmtP(b.tp)}</span> (35% retracement of the 24h move). Close all positions at 4pm AEST regardless of outcome — do not hold overnight.</div></div>
-            <div class="bstp"><div class="bstn">5.</div><div class="bstt">${b.sn}.</div></div>
+            <div class="bstp"><div class="bstn">1.</div><div class="bstt">Wait for <span>${b.et}</span>. Do not short into a still-rising move.</div></div>
+            <div class="bstp"><div class="bstn">2.</div><div class="bstt">Enter short near <span>${fmtP(b.ep)}</span>. ${b.pn}</div></div>
+            <div class="bstp"><div class="bstn">3.</div><div class="bstt">Stop above <span>${fmtP(b.sp)}</span> — a new high invalidates the thesis.</div></div>
+            <div class="bstp"><div class="bstn">4.</div><div class="bstt">Target <span>${fmtP(b.tp)}</span>. Close at 4pm AEST regardless of outcome.</div></div>
+            <div class="bstp"><div class="bstt">${b.sn}.</div></div>
           </div>
-          <div class="bwarn"><strong>Backtest parameters:</strong> 73% win rate / +3.1% expectancy over 90 days · 400 coins · 8×+ vol filter · 2-candle confirm · 10% stop · 4pm close. <strong>Risk disclaimer:</strong> Past results do not guarantee future performance. Short selling carries unlimited loss potential.</div>
+          <div class="bwarn"><strong>Backtest:</strong> 73% win rate / +3.1% expectancy · 90 days · Binance data. <strong>Risk disclaimer:</strong> Past results do not guarantee future performance. Short selling carries unlimited loss potential.</div>
         </div>
       </div>`;
     }).join('');
 
+    setProg(100, `Complete — ${results.length} signal${results.length!==1?'s':''} found`);
     updateBadge();
 
   } catch(e) {
-    err.textContent='⚠ '+(e.message||'Fetch failed — CoinGecko free tier: 30 req/min. Wait and retry.');
+    err.textContent='⚠ '+(e.message||'Scan failed. Check connection and retry.');
     err.style.display='block';
     document.getElementById('tableBody').innerHTML='<div class="stmsg"><div class="big">✕</div>Scan failed</div>';
+    setProg(0,'Failed');
   } finally {
     btn.classList.remove('loading'); pl.classList.add('idle'); lb.textContent='RUN SCAN';
   }
+}
+
+// Lock coin — Binance version (uses symbol as ID)
+function lockCoinBin(coinId) {
+  const log=loadLog();
+  if(log.find(t=>t.coinId===coinId&&(t.outcome==='open'||t.outcome==='never-entered'))) return;
+  const el=document.querySelector(`[data-cid="${coinId}"]`);
+  if(!el) return;
+  const coin=JSON.parse(el.dataset.coin);
+  const trade={
+    id:Date.now(), coinId:coin.coinId, name:coin.name, symbol:coin.symbol.toUpperCase(),
+    image:'', lockedAt:Date.now(), lockPrice:coin.current_price,
+    ep:coin.ep, sp:coin.sp, tp:coin.tp, score:coin.score,
+    gain24h:coin.price_change_percentage_24h, volRatio:coin.volRatio, mcap:coin.market_cap,
+    outcome:'open', exitP:null, pnl:null,
+    entryPrice:coin.ep, stopPrice:coin.sp, targetPrice:coin.tp
+  };
+  log.push(trade); saveLog(log);
+  const btn=document.getElementById('lk-'+coinId);
+  if(btn){btn.className='lkbtn locked';btn.textContent='✓ Locked';btn.onclick=null;}
+  updateBadge();
 }
 
 updateBadge();
